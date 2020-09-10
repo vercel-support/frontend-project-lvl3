@@ -1,25 +1,27 @@
 import 'bootstrap/dist/css/bootstrap.min.css';
-import './css/index.css';
 import * as yup from 'yup';
 import onChange from 'on-change';
 import axios from 'axios';
 import i18next from 'i18next';
-import resources from './locales';
+import { noop, uniqueId } from 'lodash';
+import { addCorsProxy } from './cors-proxy.js';
 import { renderForm, renderFeedback, renderFeeds } from './view.js';
-import { parseRssToFeed } from './parser';
+import { initAutoUpdate } from './auto-update';
+import { parseRss } from './rss-parser';
+import resources from './locales';
+
+const updateInterval = 5000;
 
 const schema = yup
   .string()
-  .url(i18next.t('feedback.invalidUrl'))
-  .required(i18next.t('feedback.rssRequired'));
+  .url(i18next.t('errorMessages.invalidUrl'))
+  .required(i18next.t('errorMessages.rssRequired'));
 
-const validateRssLink = (watchedState) => {
+const validateRssLink = (link, loadedLinks) => {
   try {
-    schema.test(
-      'check if already added',
-      i18next.t('feedback.alreadyLoaded'),
-      (link) => !watchedState.loadedLinks.includes(link),
-    ).validateSync(watchedState.form.fields.rssLink);
+    schema
+      .notOneOf(loadedLinks, i18next.t('errorMessages.alreadyLoaded'))
+      .validateSync(link);
     return [];
   } catch (validationError) {
     return validationError.errors;
@@ -27,33 +29,129 @@ const validateRssLink = (watchedState) => {
 };
 
 const updateValidationState = (watchedState) => {
-  const [error] = validateRssLink(watchedState);
-  watchedState.form.isValid = !error;
-  watchedState.feedback = {
-    message: error || '',
-    type: error ? 'error' : 'success',
-  };
+  const loadedLinks = watchedState.loadedFeeds.map((feed) => feed.link);
+  const errors = validateRssLink(watchedState.form.fields.rssLink, loadedLinks);
+  // eslint-disable-next-line no-param-reassign
+  watchedState.form.validationErrors = errors;
+  // eslint-disable-next-line no-param-reassign
+  watchedState.form.isValid = errors.length === 0;
 };
 
-const updateLoadedFeedsState = (watchedState, rssData) => {
-  const { feed, articles } = parseRssToFeed(rssData);
-  watchedState.loadedArticles = [...watchedState.loadedArticles, ...articles];
-  watchedState.loadedFeeds = [...watchedState.loadedFeeds, feed];
-  watchedState.loadedLinks = [...watchedState.loadedLinks, watchedState.form.fields.rssLink];
-  watchedState.processStatus = 'filling';
+const buildFeed = (title, link) => ({ title, link, id: uniqueId() });
+
+const buildArticle = (item, feedId) => ({
+  id: uniqueId(),
+  feedId,
+  title: item.title,
+  link: item.link,
+});
+
+const updateLoadedFeedsState = (watchedState, rssString) => {
+  const { title, items } = parseRss(rssString);
+  const feed = buildFeed(title, watchedState.form.fields.rssLink);
+  const articles = items.map((item) => buildArticle(item, feed.id));
+  // eslint-disable-next-line no-param-reassign
+  watchedState.processErrors = [];
+  watchedState.loadedArticles.push(...articles);
+  watchedState.loadedFeeds.push(feed);
+  // eslint-disable-next-line no-param-reassign
   watchedState.form.fields.rssLink = '';
-  watchedState.feedback = {
-    message: i18next.t('feedback.feedLoaded'),
-    type: 'success',
-  };
+  // eslint-disable-next-line no-param-reassign
+  watchedState.processStatus = 'loaded';
 };
 
 const handleLoadingError = (watchedState, error) => {
+  // eslint-disable-next-line no-param-reassign
+  watchedState.processErrors = [error.message];
+  // eslint-disable-next-line no-param-reassign
   watchedState.processStatus = 'failed';
-  watchedState.feedback = {
-    message: error.message,
-    type: 'error',
+};
+
+const processStatusActions = {
+  filling: noop,
+  loading: (watchedState, elements) => {
+    renderForm(watchedState, elements);
+    renderFeedback(watchedState, elements);
+  },
+  loaded: (watchedState, elements) => {
+    renderFeeds(watchedState, elements);
+    renderFeedback(watchedState, elements);
+    renderForm(watchedState, elements);
+  },
+  failed: (watchedState, elements) => {
+    renderFeedback(watchedState, elements);
+    renderForm(watchedState, elements);
+  },
+};
+
+const feedsAutoUpdateStatusActions = {
+  updating: noop,
+  updated: renderFeeds,
+  unchanged: noop,
+};
+
+const runApp = () => {
+  const state = {
+    form: {
+      isValid: false,
+      validationErrors: [],
+      fields: {
+        rssLink: '',
+      },
+    },
+    processStatus: 'filling',
+    processErrors: [],
+    feedsAutoUpdateStatus: '',
+    loadedFeeds: [],
+    loadedArticles: [],
   };
+
+  const elements = {
+    form: document.querySelector('form[data-form="load-rss-form"]'),
+    rssLinkField: document.querySelector('input[name="rss-link"]'),
+    submitButton: document.querySelector('input[data-form="submit"]'),
+    feedbackContainer: document.querySelector('.feedback'),
+    feedsContainer: document.querySelector('.feeds'),
+  };
+
+  const watchedState = onChange(state, (path, newValue) => {
+    switch (path) {
+      case 'form.validationErrors':
+        renderForm(watchedState, elements);
+        renderFeedback(watchedState, elements);
+        break;
+      case 'processStatus':
+        processStatusActions[newValue](watchedState, elements);
+        break;
+      case 'feedsAutoUpdateStatus':
+        feedsAutoUpdateStatusActions[newValue](watchedState, elements);
+        break;
+      default:
+        break;
+    }
+  });
+
+  elements.rssLinkField.addEventListener('input', (e) => {
+    watchedState.form.fields.rssLink = e.target.value.trim();
+    watchedState.processStatus = 'filling';
+  });
+
+  elements.form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    updateValidationState(watchedState);
+
+    if (!watchedState.form.isValid) return;
+
+    watchedState.processStatus = 'loading';
+    axios.get(addCorsProxy(state.form.fields.rssLink))
+      .then((response) => {
+        updateLoadedFeedsState(watchedState, response.data);
+        if (watchedState.loadedFeeds.length === 1) {
+          initAutoUpdate(watchedState, updateInterval);
+        }
+      })
+      .catch((error) => handleLoadingError(watchedState, error));
+  });
 };
 
 const app = () => {
@@ -61,62 +159,7 @@ const app = () => {
     lng: 'en',
     debug: true,
     resources,
-  }).then(() => {
-    const state = {
-      form: {
-        isValid: true,
-        fields: {
-          rssLink: '',
-        },
-      },
-      processStatus: 'filling',
-      feedback: {
-        message: '',
-        type: 'success',
-      },
-      loadedLinks: [],
-      loadedFeeds: [],
-      loadedArticles: [],
-    };
-
-    const elements = {
-      form: document.querySelector('form[data-form="load-rss-form"]'),
-      rssLinkField: document.querySelector('input[name="rss-link"]'),
-      feedbackContainer: document.querySelector('.feedback'),
-      feedsContainer: document.querySelector('.feeds'),
-    };
-
-    const watchedState = onChange(state, (path) => {
-      switch (path) {
-        case 'form.isValid':
-          renderForm(watchedState, elements);
-          break;
-        case 'feedback':
-          renderFeedback(watchedState, elements);
-          break;
-        case 'loadedFeeds':
-          renderFeeds(watchedState, elements);
-          break;
-        default:
-          break;
-      }
-    });
-
-    elements.rssLinkField.addEventListener('input', (e) => {
-      watchedState.form.fields.rssLink = e.target.value.trim();
-    });
-
-    elements.form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      updateValidationState(watchedState);
-      if (state.form.isValid) {
-        watchedState.processStatus = 'requesting';
-        axios.get(state.form.fields.rssLink)
-          .then((response) => updateLoadedFeedsState(watchedState, response.data))
-          .catch((error) => handleLoadingError(watchedState, error));
-      }
-    });
-  });
+  }).then(runApp);
 };
 
 export default app;
